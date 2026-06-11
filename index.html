@@ -1,0 +1,195 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8" />
+<meta name="viewport" content="width=device-width, initial-scale=1" />
+<title>Smart Money · Oracle</title>
+<style>
+  :root{
+    --bg:#06080d; --card:#0B0E14; --panel:#11151F; --panel2:#0E121B; --line:#1E2533;
+    --text:#E6E9EF; --muted:#8B92A5; --faint:#5B6273;
+    --bull:#27C08A; --bear:#E5575C; --neutral:#8B92A5; --pin:#E0A92E; --trend:#5B8DEF; --slate:#717A8C;
+    --mono:ui-monospace,'SF Mono','JetBrains Mono',Menlo,Consolas,monospace;
+    --sans:system-ui,-apple-system,'Segoe UI',Roboto,sans-serif;
+  }
+  *{box-sizing:border-box}
+  body{margin:0;background:var(--bg);font-family:var(--sans);color:var(--text);
+       min-height:100vh;display:flex;justify-content:center;align-items:flex-start;padding:24px}
+  .card{background:var(--card);border:1px solid var(--line);border-radius:14px;padding:18px;
+        max-width:560px;width:100%}
+  .hdr{display:flex;justify-content:space-between;align-items:flex-start;gap:12px}
+  .eyebrow{font-size:10px;letter-spacing:2.5px;color:var(--faint);text-transform:uppercase}
+  .title{font-size:17px;font-weight:650;margin-top:2px}
+  .toggle button{font-family:var(--mono);font-size:11px;letter-spacing:.5px;cursor:pointer;
+        padding:5px 9px;border-radius:7px;border:1px solid transparent;background:transparent;color:var(--muted)}
+  .toggle button.on{border-color:var(--line);background:var(--panel);color:var(--text)}
+  .rule{height:1px;background:var(--line);margin:14px 0}
+  .verdict{font-size:30px;font-weight:750;letter-spacing:.3px;line-height:1.05}
+  .pill{font-family:var(--mono);font-size:12px;font-weight:700;padding:3px 8px;border-radius:6px;margin-left:10px}
+  .row{display:flex;justify-content:space-between;font-size:13px;padding:2px 0}
+  .row .v{font-variant-numeric:tabular-nums}
+  .bar{height:5px;background:var(--panel2);border-radius:4px;margin-top:5px;overflow:hidden}
+  .bar>div{height:100%;transition:width .4s ease}
+  .grid3{display:grid;grid-template-columns:repeat(3,1fr);gap:8px;margin-top:12px}
+  .tile{background:var(--panel);border:1px solid var(--line);border-radius:9px;padding:9px 10px}
+  .tile .l{font-size:9.5px;letter-spacing:1.5px;color:var(--faint);text-transform:uppercase}
+  .tile .x{font-size:15px;font-weight:700;margin-top:3px}
+  .tile .s{font-size:10.5px;color:var(--faint);margin-top:2px;font-family:var(--mono)}
+  .metric{background:var(--panel2);border:1px solid var(--line);border-radius:9px;padding:8px 10px}
+  .metric .l{font-size:9.5px;letter-spacing:1px;color:var(--faint);text-transform:uppercase}
+  .metric .x{font-size:15px;font-weight:650;margin-top:3px;font-family:var(--mono);font-variant-numeric:tabular-nums}
+  .metric .s{font-size:10px;color:var(--faint);margin-top:1px;font-family:var(--mono)}
+  .box{margin-top:14px;padding:10px;background:var(--panel2);border-radius:9px;border:1px solid var(--line)}
+  .why .h{font-size:10px;letter-spacing:2px;color:var(--faint);text-transform:uppercase;margin:14px 0 6px}
+  .why .item{display:flex;gap:8px;font-size:13px;color:var(--muted);padding:3px 0;line-height:1.4}
+  .foot{display:flex;justify-content:space-between;align-items:center;font-size:11px;color:var(--faint);font-family:var(--mono)}
+  .dot{width:7px;height:7px;border-radius:50%;display:inline-block;margin-right:6px}
+  .note{font-size:14px;color:var(--muted);padding:10px 0}
+  .cfg{font-family:var(--mono);font-size:10.5px;color:var(--faint);margin-top:10px}
+  .cfg input{font-family:var(--mono);font-size:10.5px;background:var(--panel2);border:1px solid var(--line);
+        color:var(--muted);border-radius:6px;padding:4px 7px;width:330px;max-width:60%}
+  .disc{font-size:10.5px;color:var(--faint);margin-top:8px}
+</style>
+</head>
+<body>
+<div class="card">
+  <div class="hdr">
+    <div>
+      <div class="eyebrow">Smart Money</div>
+      <div class="title">Oracle · Positioning</div>
+    </div>
+    <div class="toggle" id="toggle"></div>
+  </div>
+  <div class="rule"></div>
+  <div id="content"><div class="note">Loading the latest stance…</div></div>
+  <div class="cfg">backend &nbsp;<input id="backend" spellcheck="false" /></div>
+</div>
+
+<script>
+// ====== EDIT THIS if your Railway URL is different ======
+let BACKEND = "https://smart-money-backend-production-e238.up.railway.app";
+// ========================================================
+const UNDERLYINGS = ["NIFTY", "BANKNIFTY"];
+const POLL_MS = 30000;
+let underlying = UNDERLYINGS[0];
+let timer = null;
+
+const ACTION_LABEL = {STAND_ASIDE:"STAND ASIDE",FADE_TO_PIN:"FADE TO PIN",
+  TRADE_WITH_BIAS:"TRADE WITH BIAS",WAIT_FOR_TRIGGER:"WAIT FOR TRIGGER"};
+const css = (k)=>getComputedStyle(document.documentElement).getPropertyValue(k).trim();
+const dirColor=(d)=>d==="BULL"?css("--bull"):d==="BEAR"?css("--bear"):css("--neutral");
+const regimeColor=(r)=>r==="PINNED"?css("--pin"):r==="TRENDING"?css("--trend"):css("--neutral");
+function actionColor(a,side){
+  if(a==="TRADE_WITH_BIAS")return side==="LONG"?css("--bull"):side==="SHORT"?css("--bear"):css("--trend");
+  if(a==="FADE_TO_PIN")return css("--pin");
+  if(a==="WAIT_FOR_TRIGGER")return css("--trend");
+  return css("--slate");
+}
+const n=(v,d=2)=>(v===null||v===undefined||isNaN(v))?"\u2014":Number(v).toFixed(d);
+function rel(a,b){if(a==null||b==null)return"\u2014";const x=Math.round(a-b);
+  return (x>0?"+":x<0?"\u2212":"")+Math.abs(x);}
+function ago(iso){if(!iso)return"\u2014";const s=Math.max(0,Math.round((Date.now()-new Date(iso))/1000));
+  return s<90?s+"s ago":s<3600?Math.round(s/60)+"m ago":Math.round(s/3600)+"h ago";}
+function istClock(iso){try{return new Date(iso).toLocaleTimeString("en-IN",{timeZone:"Asia/Kolkata",hour12:false});}catch(e){return"\u2014";}}
+const esc=(s)=>String(s).replace(/[&<>]/g,c=>({"&":"&amp;","<":"&lt;",">":"&gt;"}[c]));
+
+function renderToggle(){
+  document.getElementById("toggle").innerHTML = UNDERLYINGS.map(u=>
+    `<button class="${u===underlying?'on':''}" onclick="pick('${u}')">${u}</button>`).join("");
+}
+function pick(u){underlying=u;renderToggle();load();}
+
+function show(html){document.getElementById("content").innerHTML=html;}
+
+async function load(){
+  if(!BACKEND){show(`<div class="note" style="color:var(--bear)">No backend URL set.</div>`);return;}
+  try{
+    const [sR,mR]=await Promise.all([
+      fetch(`${BACKEND}/stance/latest?underlying=${underlying}`,{cache:"no-store"}),
+      fetch(`${BACKEND}/metrics/latest?underlying=${underlying}`,{cache:"no-store"})
+    ]);
+    if(sR.status===404){
+      show(`<div class="note">No stance yet for ${underlying}.
+        <div style="color:var(--faint);margin-top:6px;font-size:12px">
+        The engine writes one each minute during market hours (09:15–15:30 IST).</div></div>`);
+      return;
+    }
+    if(!sR.ok)throw new Error("HTTP "+sR.status);
+    const st=await sR.json();
+    const m=mR.ok?await mR.json():null;
+    render(st,m);
+  }catch(e){
+    show(`<div class="note" style="color:var(--bear)">Can’t reach the backend. ${esc(e.message||e)}
+      <div style="color:var(--faint);margin-top:6px;font-size:12px">
+      Check the URL below, that the backend is deployed, and that CORS is enabled.</div></div>`);
+  }
+}
+
+function render(st,m){
+  const ac=actionColor(st.action,st.side);
+  const fresh=(Date.now()-new Date(st.ts_ist))<90000;
+  const sidePill=(st.side&&st.side!=="NONE")
+    ? `<span class="pill" style="color:${ac};border:1px solid ${ac}55">${st.side}</span>`:"";
+  const metricsHtml = m ? `
+    <div class="grid3" style="margin-top:10px">
+      ${metric("Spot",n(m.spot,1))}
+      ${metric("PCR (OI)",n(m.pcr_oi,2))}
+      ${metric("ATM IV",m.iv_atm==null?"\u2014":n(m.iv_atm,1))}
+      ${metric("Max pain",m.max_pain??"\u2014",rel(m.max_pain,m.spot)+" vs spot")}
+      ${metric("Gamma pin",m.pin??"\u2014","conc "+n(m.pin_conc,2))}
+      ${metric("Exp move (rem)",m.em_rem==null?"\u2014":"\u00B1"+n(m.em_rem,0))}
+    </div>`:"";
+  const trig=(st.entry_trigger||st.invalidation!=null)?`
+    <div class="box">
+      ${st.entry_trigger?`<div class="row"><span style="color:var(--muted)">Trigger</span>
+        <span class="v">${esc(st.entry_trigger.type)} @ <span style="font-family:var(--mono)">${esc(st.entry_trigger.level)}</span></span></div>`:""}
+      ${st.invalidation!=null?`<div class="row"><span style="color:var(--muted)">Invalidation</span>
+        <span class="v" style="font-family:var(--mono);color:var(--bear)">${esc(st.invalidation)}</span></div>`:""}
+    </div>`:"";
+  const why=Array.isArray(st.why)&&st.why.length?`
+    <div class="why"><div class="h">Why</div>
+      ${st.why.map(w=>`<div class="item"><span style="color:var(--faint)">·</span><span>${esc(w)}</span></div>`).join("")}
+    </div>`:"";
+
+  show(`
+    <div style="display:flex;align-items:baseline;flex-wrap:wrap">
+      <span class="verdict" style="color:${ac}">${ACTION_LABEL[st.action]||esc(st.action)}</span>${sidePill}
+    </div>
+    <div style="margin-top:12px">
+      <div class="row"><span style="color:var(--muted)">Size factor</span><span class="v">${n(st.size_factor,2)}</span></div>
+      <div class="bar"><div style="width:${Math.round((st.size_factor||0)*100)}%;background:${ac}"></div></div>
+    </div>
+    <div class="grid3">
+      ${tile("Regime",st.regime,regimeColor(st.regime),"conf "+n(st.regime_confidence,2))}
+      ${tile("Direction",st.direction,dirColor(st.direction),"conv "+n(st.conviction,2))}
+      ${tile("Bias score",n(st.direction_score,2),dirColor(st.direction),"",true)}
+    </div>
+    ${metricsHtml}${trig}${why}
+    <div class="rule" style="margin:14px 0 10px"></div>
+    <div class="foot">
+      <span><span class="dot" style="background:${fresh?'var(--bull)':'var(--pin)'}"></span>${istClock(st.ts_ist)} IST · ${ago(st.ts_ist)}</span>
+      <span>${esc(st.inputs_ref||"")}</span>
+    </div>
+    <div class="disc">Mechanical posture from option positioning — not investment advice.</div>
+  `);
+}
+function tile(l,x,color,sub,mono){
+  return `<div class="tile"><div class="l">${l}</div>
+    <div class="x" style="color:${color||'var(--text)'};${mono?'font-family:var(--mono)':''};font-variant-numeric:tabular-nums">${esc(x)}</div>
+    ${sub?`<div class="s">${esc(sub)}</div>`:""}</div>`;
+}
+function metric(l,x,note){
+  return `<div class="metric"><div class="l">${l}</div><div class="x">${esc(x)}</div>
+    ${note?`<div class="s">${esc(note)}</div>`:""}</div>`;
+}
+
+// init
+const bi=document.getElementById("backend");
+bi.value=BACKEND;
+bi.addEventListener("change",()=>{BACKEND=bi.value.trim().replace(/\/$/,"");load();});
+renderToggle();
+load();
+timer=setInterval(load,POLL_MS);
+</script>
+</body>
+</html>
