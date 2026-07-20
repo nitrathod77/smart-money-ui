@@ -1,8 +1,5 @@
 import React, { useState, useEffect, useMemo, useRef } from 'react';
 import {
-  BarChart, Bar, XAxis, YAxis, Tooltip, ResponsiveContainer, ReferenceLine, Legend,
-} from 'recharts';
-import {
   TrendingUp, TrendingDown, Minus, AlertTriangle, Activity, Layers, Zap,
   RotateCcw, ChevronRight, Radio, RefreshCw,
   Settings, KeyRound, X, ExternalLink, LogOut, Loader2, Crosshair,
@@ -461,6 +458,22 @@ function structureBias(swings) {
   return 'neutral';
 }
 
+// Momentum fallback for bias. Pure swing-structure returns 'neutral' on strong trends (no internal
+// pivots form) and on chop (mixed swings) — i.e. most real days. When structure is inconclusive,
+// fall back to where price actually travelled across the window: net move as a fraction of the
+// window's range. A decisive directional move then registers instead of defaulting to neutral.
+function trendBias(candles, threshold = 0.33) {
+  if (!Array.isArray(candles) || candles.length < 5) return 'neutral';
+  const px = c => (c.c != null ? c.c : (c.h + c.l) / 2);
+  const first = px(candles[0]), last = px(candles[candles.length - 1]);
+  const hi = Math.max(...candles.map(c => c.h)), lo = Math.min(...candles.map(c => c.l));
+  const range = (hi - lo) || 1;
+  const move = (last - first) / range; // signed fraction of the full range
+  if (move >= threshold) return 'bullish';
+  if (move <= -threshold) return 'bearish';
+  return 'neutral';
+}
+
 // Qualified MSS — a structure break preceded by a same-direction liquidity sweep within N bars.
 // (Sweep grabs liquidity, then price breaks structure the same way = a true ICT shift, not noise.)
 function qualifyMSS(sweeps, mss, withinBars = 6) {
@@ -470,45 +483,132 @@ function qualifyMSS(sweeps, mss, withinBars = 6) {
 // Top-down assembly — chains the layers into one checklist-style read. sets = {h1,m15,m5,m1} arrays.
 // 1H gives bias; 15M gives premium/discount + an OB zone; 5M gives the qualified sweep+MSS trigger;
 // 1M/5M last close is the working price. status: 'ready' (all align), 'forming' (partial), 'none'.
-function ictTopDown(sets) {
-  const analyzeTF = (candles) => {
-    const sw = detectSwings(candles, 2);
-    const obs = freshZones(markMitigated(detectOrderBlocks(candles), candles));
-    return { sw, sweeps: detectSweeps(candles, sw), mss: detectMSS(candles, sw), bias: structureBias(sw), obs };
+// Session liquidity — the levels NIFTY actually hunts intraday: prior-day high/low (PDH/PDL)
+// and the opening-range (first hour) high/low. Computed from raw multi-day candles (timestamps
+// in epoch seconds; IST = UTC+5:30). Returns the latest session's reference levels.
+function sessionLevels(candles) {
+  if (!candles || candles.length < 2) return null;
+  const dayOf = t => Math.floor((t + 19800) / 86400); // IST calendar day
+  const byDay = new Map();
+  for (const c of candles) {
+    const d = dayOf(c.t);
+    if (!byDay.has(d)) byDay.set(d, []);
+    byDay.get(d).push(c);
+  }
+  const days = [...byDay.keys()].sort((a, b) => a - b);
+  const today = byDay.get(days[days.length - 1]);
+  const prior = days.length >= 2 ? byDay.get(days[days.length - 2]) : null;
+  const hi = arr => Math.max(...arr.map(c => c.h));
+  const lo = arr => Math.min(...arr.map(c => c.l));
+  const openT = today[0].t;
+  const orBars = today.filter(c => c.t < openT + 3600); // first 60 min
+  return {
+    pdh: prior ? hi(prior) : null,
+    pdl: prior ? lo(prior) : null,
+    orh: orBars.length ? hi(orBars) : null,
+    orl: orBars.length ? lo(orBars) : null,
+    todayStart: openT,
   };
-  const h1 = sets.h1?.length ? analyzeTF(scopeCandles(sets.h1, '60')) : null;
-  const m15 = sets.m15?.length ? analyzeTF(scopeCandles(sets.m15, '15')) : null;
-  const m5 = sets.m5?.length ? analyzeTF(scopeCandles(sets.m5, '5')) : null;
+}
+
+// Key-level sweeps — for each named level, find the first candle that sweeps it (wicks through
+// then closes back inside = liquidity grab, not a breakout). High-side sweep = bearish intent
+// (buy-side liquidity taken); low-side = bullish.
+function detectKeyLevelSweeps(candles, levels) {
+  const out = [];
+  for (const lv of levels) {
+    if (lv.price == null) continue;
+    for (let i = 1; i < candles.length; i++) {
+      const c = candles[i];
+      if (lv.side === 'high') {
+        if (c.h > lv.price) { if (c.c < lv.price) out.push({ name: lv.name, price: lv.price, side: 'high', idx: i, t: c.t, dir: 'bearish' }); break; }
+      } else {
+        if (c.l < lv.price) { if (c.c > lv.price) out.push({ name: lv.name, price: lv.price, side: 'low', idx: i, t: c.t, dir: 'bullish' }); break; }
+      }
+    }
+  }
+  return out.sort((a, b) => a.t - b.t);
+}
+
+function ictTopDown(sets) {
+  const tf = (candles) => {
+    const sw = detectSwings(candles, 2);
+    return { candles, sw, sweeps: detectSweeps(candles, sw), mss: detectMSS(candles, sw), bias: structureBias(sw), obs: freshZones(markMitigated(detectOrderBlocks(candles), candles)) };
+  };
+  const h1 = sets.h1?.length ? tf(scopeCandles(sets.h1, '60')) : null;
+  const m15 = sets.m15?.length ? tf(scopeCandles(sets.m15, '15')) : null;
+  const m5 = sets.m5?.length ? tf(scopeCandles(sets.m5, '5')) : null;
   const price = sets.m1?.[sets.m1.length - 1]?.c ?? sets.m5?.[sets.m5.length - 1]?.c ?? null;
 
-  const bias = h1?.bias || 'neutral';
+  // 1H = directional bias. Prefer swing-structure; if that's inconclusive (no pivots on a trend
+  // day, or mixed swings on a chop day), fall back to 1H momentum so strong moves still register.
+  let bias = h1?.bias || 'neutral';
+  let biasSource = 'structure';
+  if (bias === 'neutral') {
+    const tb = trendBias(h1?.candles) !== 'neutral' ? trendBias(h1?.candles) : trendBias(m15?.candles);
+    if (tb !== 'neutral') { bias = tb; biasSource = 'momentum'; }
+  }
   const pd = m15 ? premiumDiscount(m15.sw, price) : null;
-  const qmss5 = m5 ? qualifyMSS(m5.sweeps, m5.mss) : [];
-  const lastQ = qmss5[qmss5.length - 1] || null;
-  const triggerAligned = !!(lastQ && lastQ.dir === bias);
   const zoneOk = !!(pd && ((bias === 'bullish' && pd.zone !== 'premium') || (bias === 'bearish' && pd.zone !== 'discount')));
   const obDir = bias === 'bullish' ? 'bullish' : 'bearish';
-  const ob = m15?.obs.filter(o => o.type === obDir).slice(-1)[0] || null;
+  const ob = m15?.obs.filter(o => o.type === obDir).slice(-1)[0] || null; // 15M order block = entry zone
+
+  // Key intraday liquidity (from raw multi-day 5M candles): PDH/PDL + opening-range high/low.
+  const lv = sessionLevels(sets.m5 && sets.m5.length ? sets.m5 : (sets.m15 || []));
+  const buySide = lv ? [{ name: 'PDH', price: lv.pdh }, { name: 'opening-range high', price: lv.orh }].filter(x => x.price != null).map(x => ({ ...x, side: 'high' })) : [];
+  const sellSide = lv ? [{ name: 'PDL', price: lv.pdl }, { name: 'opening-range low', price: lv.orl }].filter(x => x.price != null).map(x => ({ ...x, side: 'low' })) : [];
+  const relevant = bias === 'bearish' ? buySide : bias === 'bullish' ? sellSide : [];
+
+  // PRIMARY sweep on 15M (today only) — a real liquidity grab of PDH/PDL/opening-range.
+  const today15 = lv ? (sets.m15 || []).filter(c => c.t >= lv.todayStart) : [];
+  const keySweeps = relevant.length ? detectKeyLevelSweeps(today15, relevant).filter(s => s.dir === bias) : [];
+  const keySweep = keySweeps[keySweeps.length - 1] || null;
+
+  // ENTRY trigger on 5M — qualified 5M sweep+MSS (inducement + break) aligned with bias, AFTER
+  // the 15M key sweep. This is the inducement-grab-then-shift that confirms the entry.
+  let triggerFired = false;
+  if (keySweep && m5) {
+    const qmss = qualifyMSS(m5.sweeps, m5.mss).filter(m => m.dir === bias && m.t >= keySweep.t);
+    triggerFired = qmss.length > 0;
+  }
+
+  // Plan levels: the key level to be swept (sweepLevel) + the 5M level whose break confirms entry.
+  let triggerPlan = null;
+  if (m5 && bias !== 'neutral' && price != null) {
+    const lows = m5.sw.filter(s => s.type === 'low').map(s => s.price);
+    const highs = m5.sw.filter(s => s.type === 'high').map(s => s.price);
+    if (bias === 'bearish' && lows.length) {
+      const below = lows.filter(l => l < price).sort((a, b) => b - a);
+      triggerPlan = { dir: 'down', side: 'sell', sweepLevel: keySweep ? keySweep.price : (relevant[0]?.price ?? null), sweepName: keySweep ? keySweep.name : (relevant[0]?.name ?? 'a 15M swing high'), breakLevel: below[0] ?? Math.min(...lows) };
+    } else if (bias === 'bullish' && highs.length) {
+      const above = highs.filter(h => h > price).sort((a, b) => a - b);
+      triggerPlan = { dir: 'up', side: 'buy', sweepLevel: keySweep ? keySweep.price : (relevant[0]?.price ?? null), sweepName: keySweep ? keySweep.name : (relevant[0]?.name ?? 'a 15M swing low'), breakLevel: above[0] ?? Math.max(...highs) };
+    }
+  }
 
   const notes = [];
   let status = 'none';
   if (bias === 'neutral') {
-    notes.push('Big picture (1H): no clear trend — best to stand aside');
+    notes.push('Big picture (1H): no clear trend (structure mixed and momentum flat) — best to stand aside');
   } else {
     const dirWord = bias === 'bullish' ? 'up' : 'down';
     const side = bias === 'bullish' ? 'buy' : 'sell';
-    notes.push(`Big picture (1H): trending ${dirWord}`);
+    notes.push(`Big picture (1H): trending ${dirWord}${biasSource === 'momentum' ? ' (by momentum)' : ''}`);
     if (pd) {
       const half = pd.zone === 'premium' ? 'upper half' : pd.zone === 'discount' ? 'lower half' : 'middle';
       notes.push(`Price is in the ${half} of its recent range`);
     }
-    notes.push(zoneOk ? `Price location is OK for a ${side}` : `Price location is poor for a ${side} — wait for a better price`);
-    notes.push(triggerAligned ? `Entry signal: FIRED (5M stop-hunt then ${dirWord}-break)` : 'Entry signal: not yet (waiting for a 5M stop-hunt + break)');
-    if (ob) notes.push(`${bias === 'bullish' ? 'Buy' : 'Sell'} zone to watch: ${Math.round(ob.low)}–${Math.round(ob.high)}`);
-    if (triggerAligned && zoneOk && ob) status = 'ready';
-    else if (zoneOk || triggerAligned) status = 'forming';
+    if (keySweep) notes.push(`15M sweep of ${keySweep.name} (${Math.round(keySweep.price)}) — liquidity grabbed`);
+    else if (relevant.length) notes.push(`Watching for a 15M sweep of ${relevant.map(r => r.name).join(' / ')}`);
+    else notes.push('No prior-day / opening-range level mapped yet');
+    notes.push(triggerFired ? `5M entry trigger FIRED (inducement grabbed + ${dirWord}-break)` : (keySweep ? '5M entry not fired yet' : 'no 15M sweep yet'));
+    if (ob) notes.push(`${side === 'buy' ? 'Buy' : 'Sell'} zone (15M OB): ${Math.round(ob.low)}–${Math.round(ob.high)}`);
+
+    if (keySweep && triggerFired) status = 'ready';
+    else if (keySweep) status = 'armed';
+    else status = 'watching';
   }
-  return { bias, zone: pd?.zone || null, dealingRange: pd, trigger: lastQ, triggerAligned, zoneOk, ob, status, notes, price };
+  return { bias, zone: pd?.zone || null, dealingRange: pd, zoneOk, ob, keyLevels: lv, keySweep, triggerFired, triggerPlan, status, notes, price };
 }
 
 // Gamma confluence — overlays the ICT top-down setup with the options gamma read (pin/flip/regime).
@@ -534,6 +634,26 @@ function gammaConfluence(ict, gamma, spot) {
   }
   const level = score >= 2 ? 'strong' : score === 1 ? 'supportive' : score === 0 ? 'mixed' : 'conflicting';
   return { level, score, notes };
+}
+
+// Live setup decision. Turns the ICT top-down result + options confluence + mode into a single
+// fire/hold state. Balanced fires on the 3-gate structural core (bias + 15M sweep + 5M entry);
+// Strict additionally requires the options read to agree. Pure — no side effects.
+function evalSignal(ict, mode = 'balanced') {
+  if (!ict || ict.status === 'none' || !ict.bias || ict.bias === 'neutral') return { state: 'idle' };
+  const conf = ict.confluence?.level || 'n/a';
+  const optionsAgree = conf === 'strong' || conf === 'supportive';
+  const optionsFight = conf === 'conflicting';
+  const base = { direction: ict.bias, side: ict.bias === 'bullish' ? 'BUY' : 'SELL', optionsAgree, optionsFight };
+  const core = ict.status === 'ready'; // bias + 15M key-level sweep + 5M entry break all true
+  if (!core) return { state: ict.status, ...base }; // 'armed' or 'watching'
+  if (mode === 'strict' && !optionsAgree) return { state: 'armed_waiting_options', ...base };
+  return {
+    state: 'fired',
+    entry: ict.triggerPlan?.breakLevel ?? null,
+    sweepName: ict.triggerPlan?.sweepName ?? null,
+    ...base,
+  };
 }
 
 function analyzeChain(rows, spot, openSpot = null, dayOpenIsTrue = false, expiryStr = null) {
@@ -2210,8 +2330,15 @@ function MainApp({ user, onLogout }) {
   const [autoFetchOn, setAutoFetchOn] = useState(true);
   // ICT top-down: fetch all four timeframes and run the assembly.
   const [ictResult, setIctResult] = useState(null); // {loading, error, status, bias, notes,...}
-  const runTopDown = async () => {
-    setIctResult({ loading: true });
+  const [signalMode, setSignalMode] = useState(() => storage.get('signal-mode') || 'balanced'); // 'balanced' | 'strict'
+  const [signalAlert, setSignalAlert] = useState(null); // {side, entry, sweepName, at} — latest fired signal banner
+  const ictRunningRef = useRef(false);
+  const firedKeyRef = useRef(null);
+  useEffect(() => { storage.set('signal-mode', signalMode); }, [signalMode]);
+  const runTopDown = async (quiet = false) => {
+    if (quiet && ictRunningRef.current) return; // skip overlap on the auto-loop
+    ictRunningRef.current = true;
+    if (!quiet) setIctResult({ loading: true });
     try {
       const tfs = { h1: '60', m15: '15', m5: '5', m1: '1' };
       const sets = {};
@@ -2220,7 +2347,7 @@ function MainApp({ user, onLogout }) {
           headers: { 'x-dhan-client-id': dhanClientId, 'x-dhan-access-token': dhanAccessToken },
         });
         const j = await r.json();
-        if (!r.ok) { setIctResult({ error: j.error || `HTTP ${r.status} on ${iv}m` }); return; }
+        if (!r.ok) { if (!quiet) setIctResult({ error: j.error || `HTTP ${r.status} on ${iv}m` }); ictRunningRef.current = false; return; }
         sets[key] = j.candles || [];
       }
       const td = ictTopDown(sets);
@@ -2228,7 +2355,9 @@ function MainApp({ user, onLogout }) {
       const conf = a ? gammaConfluence(td, a, current?.spot) : null;
       setIctResult({ ...td, confluence: conf });
     } catch (e) {
-      setIctResult({ error: e.message });
+      if (!quiet) setIctResult({ error: e.message });
+    } finally {
+      ictRunningRef.current = false;
     }
   };
   // ICT chart: load candles for a timeframe and render the SVG chart.
@@ -2297,7 +2426,10 @@ function MainApp({ user, onLogout }) {
     let cancelled = false;
     const tick = () => {
       if (cancelled) return;
-      if (isMarketOpenNow()) fetchChainOnly(true); // silent = no spinner
+      if (isMarketOpenNow()) {
+        fetchChainOnly(true); // silent = no spinner
+        if (provider === 'dhan' && dhanClientId && dhanAccessToken) runTopDown(true); // quiet auto-eval
+      }
     };
     tick(); // immediate first pull
     const id = setInterval(tick, 60 * 1000);
@@ -2310,6 +2442,28 @@ function MainApp({ user, onLogout }) {
     const id = setInterval(() => setFetchTick(t => t + 1), 1000);
     return () => clearInterval(id);
   }, []);
+
+  // Live setup decision derived from the ICT result + the selected mode.
+  const signal = useMemo(() => evalSignal(ictResult, signalMode), [ictResult, signalMode]);
+
+  // Alert once when a fresh signal fires (browser notification + on-screen banner). Keyed so the
+  // same signal doesn't re-alert on every 60s re-eval; a new direction/entry is a new alert.
+  useEffect(() => {
+    if (signal?.state !== 'fired' || signal.entry == null) return;
+    const key = `${signal.side}@${signal.entry}@${new Date().toDateString()}`;
+    if (firedKeyRef.current === key) return;
+    firedKeyRef.current = key;
+    setSignalAlert({ side: signal.side, entry: signal.entry, sweepName: signal.sweepName, optionsFight: signal.optionsFight, at: new Date() });
+    try {
+      if ('Notification' in window) {
+        if (Notification.permission === 'granted') {
+          new Notification(`Signal: ${signal.side} ${symbol}`, { body: `Entry on 5M break of ${Math.round(signal.entry)} · ${signal.sweepName || ''} swept` });
+        } else if (Notification.permission !== 'denied') {
+          Notification.requestPermission();
+        }
+      }
+    } catch { /* notifications unavailable */ }
+  }, [signal, symbol]);
 
   // The slot a fetch/analyze writes to. In Live mode every pull lands in one 'LIVE'
   // slot (always overwritten with the latest) so frequent polling just refreshes the
@@ -2607,12 +2761,37 @@ function MainApp({ user, onLogout }) {
                       : <>{candleTest.count} candles · {candleTest.swings} swings{candleTest.bsl != null ? ` · BSL ${Math.round(candleTest.bsl)}/SSL ${Math.round(candleTest.ssl)}` : ''} · {candleTest.sweeps} sweeps{candleTest.lastSweep ? ` (last ${candleTest.lastSweep.side} ${candleTest.lastSweep.dir})` : ''} · {candleTest.mss} MSS{candleTest.lastMss ? ` (last ${candleTest.lastMss.dir})` : ''} · EQH {candleTest.eqh}/EQL {candleTest.eql} · {candleTest.obs} OB ({candleTest.obFresh} fresh) · {candleTest.fvgs} FVG ({candleTest.fvgFresh} fresh){candleTest.scoped != null && candleTest.count > candleTest.scoped ? ` · scoped ${candleTest.scoped}/${candleTest.count}` : ''}</>}
                   </span>
                 )}
-                <button
-                  onClick={runTopDown}
-                  className="text-[11px] font-mono px-2 py-1 rounded border border-amber-300 bg-amber-50 text-amber-700 hover:bg-amber-100 ml-auto"
-                >
-                  Top-down ▸
-                </button>
+                <div className="ml-auto flex items-center gap-1">
+                  <span className="text-[10px] font-mono text-slate-400 uppercase tracking-wider mr-0.5">mode</span>
+                  {['balanced', 'strict'].map(m => (
+                    <button key={m} onClick={() => setSignalMode(m)}
+                      className={`text-[11px] font-mono px-2 py-1 rounded border ${signalMode === m ? 'border-slate-400 bg-slate-200 text-slate-800' : 'border-slate-200 bg-white text-slate-500 hover:bg-slate-50'}`}>
+                      {m}
+                    </button>
+                  ))}
+                  <button
+                    onClick={() => runTopDown(false)}
+                    className="text-[11px] font-mono px-2 py-1 rounded border border-amber-300 bg-amber-50 text-amber-700 hover:bg-amber-100"
+                  >
+                    Top-down ▸
+                  </button>
+                </div>
+              </div>
+            )}
+
+            {/* LIVE SIGNAL banner — persists until dismissed so you catch fires while away */}
+            {user?.isAdmin && provider === 'dhan' && signalAlert && (
+              <div className="mb-3 rounded-lg px-4 py-3 border-2 border-amber-400 bg-amber-50 flex items-start gap-3">
+                <Radio className="w-5 h-5 text-amber-600 mt-0.5 shrink-0" />
+                <div className="flex-1">
+                  <div className={`text-sm font-bold ${signalAlert.side === 'BUY' ? 'text-emerald-700' : 'text-red-700'}`}>
+                    SIGNAL: {signalAlert.side} {symbol}{signalAlert.entry != null ? ` · enter on a 5M break of ${Math.round(signalAlert.entry)}` : ''}
+                  </div>
+                  <div className="text-[11px] text-slate-600 font-mono mt-0.5">
+                    {signalAlert.sweepName ? `${signalAlert.sweepName} swept · ` : ''}{signalAlert.optionsFight ? 'options fighting ⚠' : 'options not fighting'} · {signalMode} mode · fired {signalAlert.at.toLocaleTimeString()}
+                  </div>
+                </div>
+                <button onClick={() => setSignalAlert(null)} className="text-slate-400 hover:text-slate-700 text-xs shrink-0">✕</button>
               </div>
             )}
 
@@ -2625,8 +2804,29 @@ function MainApp({ user, onLogout }) {
                     <div className="text-[11px] font-mono text-slate-700">
                       <span className="uppercase tracking-wider text-slate-500">Setup direction:</span>{' '}
                       <span className={`font-bold ${ictResult.bias === 'bullish' ? 'text-emerald-700' : ictResult.bias === 'bearish' ? 'text-red-700' : 'text-slate-500'}`}>{ictResult.bias === 'bullish' ? 'up (look to buy)' : ictResult.bias === 'bearish' ? 'down (look to sell)' : 'no clear trend'}</span>
-                      {' · '}<span className="font-bold">{ictResult.status === 'ready' ? 'READY TO ACT' : ictResult.status === 'forming' ? 'NOT READY YET' : 'NOTHING HERE'}</span>
+                      {' · '}<span className={`font-bold ${signal?.state === 'fired' ? (signal.side === 'BUY' ? 'text-emerald-700' : 'text-red-700') : ''}`}>{
+                        signal?.state === 'fired' ? `🔔 FIRED — ${signal.side}`
+                          : signal?.state === 'armed_waiting_options' ? 'SETUP ARMED — waiting for options to agree (strict)'
+                          : ictResult.status === 'ready' ? 'TRIGGER FIRED'
+                          : ictResult.status === 'armed' ? 'SETUP ARMED — awaiting 5M entry'
+                          : ictResult.status === 'watching' ? 'WATCHING — awaiting 15M sweep'
+                          : 'no clear setup yet'
+                      }</span>
                       <span className="block mt-1 text-slate-600 font-sans">{ictResult.notes?.join(' · ')}</span>
+                      {ictResult.triggerPlan && ictResult.status !== 'none' && (
+                        <span className="block mt-1.5 font-sans text-slate-800 bg-slate-50 border border-slate-200 rounded px-2 py-1.5">
+                          <span className="uppercase tracking-wider text-[10px] text-slate-500">Your plan: </span>
+                          {ictResult.status === 'watching' && ictResult.triggerPlan.sweepLevel != null && (
+                            <>Wait for a 15M sweep of <span className="font-bold">{ictResult.triggerPlan.sweepName} ({Math.round(ictResult.triggerPlan.sweepLevel)})</span>. Then {ictResult.triggerPlan.side}{' '}{ictResult.ob ? <>into <span className="font-bold">{Math.round(ictResult.ob.low)}–{Math.round(ictResult.ob.high)}</span></> : 'into the 15M order block'} on a 5M close {ictResult.triggerPlan.dir === 'down' ? 'below' : 'above'} <span className="font-bold">{Math.round(ictResult.triggerPlan.breakLevel)}</span>.</>
+                          )}
+                          {ictResult.status === 'armed' && (
+                            <><span className="font-bold">{ictResult.triggerPlan.sweepName}</span> swept — setup armed. {ictResult.triggerPlan.side === 'sell' ? 'Sell' : 'Buy'} {ictResult.ob ? <>into <span className="font-bold">{Math.round(ictResult.ob.low)}–{Math.round(ictResult.ob.high)}</span></> : 'into the 15M order block'}; set an alert to enter on a 5M close {ictResult.triggerPlan.dir === 'down' ? 'below' : 'above'} <span className="font-bold">{Math.round(ictResult.triggerPlan.breakLevel)}</span>.</>
+                          )}
+                          {ictResult.status === 'ready' && (
+                            <>Triggered — <span className="font-bold">{ictResult.triggerPlan.sweepName}</span> swept and 5M broke {ictResult.triggerPlan.dir === 'down' ? 'below' : 'above'} <span className="font-bold">{Math.round(ictResult.triggerPlan.breakLevel)}</span>. Confirm on the chart before entering.</>
+                          )}
+                        </span>
+                      )}
                       {ictResult.confluence && ictResult.confluence.level !== 'n/a' && (
                         <span className={`block mt-1 font-sans ${ictResult.confluence.level === 'strong' ? 'text-emerald-700' : ictResult.confluence.level === 'conflicting' ? 'text-red-700' : 'text-slate-600'}`}>
                           <span className="uppercase tracking-wider text-[10px]">Options agreement: </span>
@@ -2837,7 +3037,7 @@ function MainApp({ user, onLogout }) {
 
       <div className="border-t border-slate-200 mt-12 py-6 text-center text-[11px] text-slate-500 font-mono leading-relaxed max-w-3xl mx-auto px-6">
         Educational analysis of publicly available option chain data. Not investment advice, not a SEBI-registered advisory service. All trading decisions and outcomes are your own responsibility. Options trading carries uncapped risk on the short side and total premium loss on the buy side.
-        <div className="mt-3 text-[10px] text-amber-600 font-bold tracking-widest">BUILD v75 · TRACK A · SIGNAL LOGGER</div>
+        <div className="mt-3 text-[10px] text-amber-600 font-bold tracking-widest">BUILD v82 · LIVE SIGNAL ENGINE (balanced/strict toggle)</div>
       </div>
     </div>
   );
@@ -2945,170 +3145,6 @@ function AnalysisView({ snapshot, comparison, previousInterval, user }) {
         );
       })()}
 
-      {/* UNIFIED DECISION CARD — verdict + recommended trade + EV/cut-off in one hero */}
-      {(() => {
-        const idea = generateTradeIdea(analysis, rows, spot, snapshot?.expiry, null, lotSize, snapshot?.symbol);
-        const isTrade = idea.action !== 'NO_TRADE';
-        const dirWord = idea.action === 'BUY_CE' ? 'CE' : idea.action === 'BUY_PE' ? 'PE' : '';
-        const evBad = idea.expectedValuePts != null && idea.expectedValuePts < 0;
-        const showWarn = isTrade && (idea.pastCutoff || evBad);
-        // Which strike depth is shown — follows the user's selection in the cards below (lifted state)
-        const depthLabels = ['ATM', '2-ITM', '3-ITM'];
-        const defIdx = idea.tradeOptions ? Math.max(0, idea.tradeOptions.findIndex(o => o.isDefault)) : 1;
-        const selIdx = selectedDepthIdx != null ? selectedDepthIdx : defIdx;
-        const selOpt = (idea.tradeOptions && idea.tradeOptions[selIdx]) || null;
-        const showStrike = selOpt ? selOpt.strike : idea.strike;
-        const showEntry = selOpt ? selOpt.entryPremium : idea.entryPremium;
-        const showTgt = selOpt ? selOpt.targetPremiumPerShare : idea.targetPremiumPerShare;
-        const showSl = selOpt ? selOpt.slPremiumPerShare : idea.slPremiumPerShare;
-        return (
-          <div className={`rounded-xl border-2 ${c.border} ${c.bg} p-5`}>
-            <div className="flex items-start justify-between flex-wrap gap-4">
-              <div>
-                <div className="text-[10px] font-mono text-slate-800 mb-1 uppercase tracking-wider flex items-center gap-2">
-                  Smart money verdict — {snapshot.interval}
-                  {source === 'live' && <span className="px-1.5 py-0.5 bg-emerald-100 border border-emerald-300 text-emerald-600 rounded text-[9px]">LIVE</span>}
-                </div>
-                <div className={`text-3xl font-bold ${c.text}`}>{verdict.label}</div>
-                <div className="text-xs text-slate-800 mt-1 font-mono">
-                  Score: {verdict.score.toFixed(1)} · Spot: {fmtPlain(Math.round(spot))} · {new Date(timestamp).toLocaleTimeString('en-IN')}
-                </div>
-              </div>
-              <div className="text-right">
-                {verdict.color === 'emerald' && <TrendingUp className={`w-10 h-10 ${c.text}`} />}
-                {verdict.color === 'red' && <TrendingDown className={`w-10 h-10 ${c.text}`} />}
-                {verdict.color === 'amber' && <Minus className={`w-10 h-10 ${c.text}`} />}
-              </div>
-            </div>
-
-            {/* Recommended trade summary — pulled up into the decision */}
-            {isTrade && (
-              <div className="mt-4 bg-white/70 border border-slate-200 rounded-lg px-4 py-3 flex flex-wrap items-baseline gap-x-4 gap-y-1">
-                <span className="text-[10px] font-mono text-slate-800 uppercase tracking-wider w-full sm:w-auto">Recommended · {depthLabels[selIdx] || '2-ITM'}</span>
-                <span className="text-base font-bold text-slate-800 font-mono">Buy {showStrike} {dirWord}</span>
-                <span className="text-sm text-slate-800 font-mono">@ ₹{showEntry?.toFixed(2)}</span>
-                <span className="text-xs font-mono text-emerald-700">tgt ₹{showTgt?.toFixed(0)}</span>
-                <span className="text-xs font-mono text-red-700">sl ₹{showSl?.toFixed(0)}</span>
-                {idea.expectedValuePts != null && (
-                  <span className={`text-xs font-mono ml-auto ${evBad ? 'text-red-600 font-bold' : 'text-emerald-700'}`}>EV {idea.expectedValuePts > 0 ? '+' : ''}{idea.expectedValuePts} pts</span>
-                )}
-              </div>
-            )}
-
-            {/* Elevated blocker strip — the things that should stop you, made prominent */}
-            {showWarn && (
-              <div className="mt-3 bg-red-50 border border-red-300 rounded-lg px-4 py-2.5 flex items-start gap-2.5">
-                <AlertTriangle className="w-4 h-4 text-red-600 flex-shrink-0 mt-0.5" />
-                <div className="text-xs text-red-700 leading-relaxed">
-                  {idea.pastCutoff && <span className="font-semibold">Past 3:05 PM cut-off — no fresh same-day entry. </span>}
-                  {evBad && <span>Expected value is negative ({idea.expectedValuePts} pts) — a thin / unfavourable setup. Treat as informational.</span>}
-                </div>
-              </div>
-            )}
-
-            {verdict.divergence && (
-              <div className="mt-3 bg-amber-50 border-2 border-amber-400 rounded-lg p-3 flex items-start gap-2.5">
-                <AlertTriangle className="w-5 h-5 text-amber-600 flex-shrink-0 mt-0.5" />
-                <div>
-                  <div className="text-xs font-bold text-amber-800 uppercase tracking-wide mb-1">Price vs positioning divergence</div>
-                  <div className="text-sm text-amber-900 leading-relaxed">{verdict.divergence.text}</div>
-                </div>
-              </div>
-            )}
-
-            {/* Reasons — supporting (aligned with verdict) first */}
-            <div className="mt-4 space-y-2">
-              {[...verdict.reasons].sort((a, b) => {
-                const rank = (t) => {
-                  if (verdict.color === 'emerald') return t === 'bullish' ? 0 : t === 'bearish' ? 2 : 1;
-                  if (verdict.color === 'red') return t === 'bearish' ? 0 : t === 'bullish' ? 2 : 1;
-                  return t === 'warning' ? 0 : 1;
-                };
-                return rank(a.type) - rank(b.type);
-              }).map((r, i) => (
-                <div key={i} className={`flex items-start gap-2 text-sm ${
-                  r.type === 'bullish' ? 'text-emerald-700' :
-                  r.type === 'bearish' ? 'text-red-700' :
-                  r.type === 'warning' ? 'text-amber-700 font-semibold' :
-                  'text-slate-800'
-                }`}>
-                  <span className="font-mono text-xs mt-0.5">{r.type === 'bullish' ? '▲' : r.type === 'bearish' ? '▼' : r.type === 'warning' ? '⚠' : '•'}</span>
-                  <span>{r.text}</span>
-                </div>
-              ))}
-            </div>
-          </div>
-        );
-      })()}
-
-      {/* POSITIONING READ — observed directional bias from smart money footprint */}
-      <TradeIdeaCard idea={generateTradeIdea(analysis, rows, spot, snapshot?.expiry, null, lotSize, snapshot?.symbol)} spot={spot} isAdmin={user?.isAdmin} snapshot={snapshot} verdict={verdict} selectedDepth={selectedDepthIdx} onSelectDepth={setSelectedDepthIdx} />
-
-      {/* Phase 3: the OI-profile and change-in-OI charts are consolidated into the single
-          combined FootprintChart below (which shows total OI + ΔOI together with controls). */}
-
-      {/* STRIKE FOCUS — pick any strike (dropdown or click a chart bar) to see its trade math */}
-      {(() => {
-        const focusIdea = focusStrike != null ? generateTradeIdea(analysis, rows, spot, snapshot?.expiry, focusStrike, lotSize, snapshot?.symbol) : null;
-        const fo = focusIdea?.focusedOption;
-        const dirType = focusIdea?.directionType;
-        const sortedStrikes = [...new Set(rows.map(r => r.strike))].sort((a, b) => a - b);
-        return (
-          <div className="bg-white border border-slate-200 rounded-xl card-shadow overflow-hidden">
-            <div className="px-5 py-4 border-b border-slate-100 flex items-center justify-between flex-wrap gap-3">
-              <h3 className="text-sm font-semibold text-slate-800 flex items-center gap-2">
-                <Crosshair className="w-4 h-4 text-amber-500" />
-                Strike focus
-              </h3>
-              <div className="flex items-center gap-2">
-                <select
-                  value={focusStrike ?? ''}
-                  onChange={(e) => setFocusStrike(e.target.value ? Number(e.target.value) : null)}
-                  className="text-xs font-mono border border-slate-200 rounded-md px-2 py-1.5 bg-white text-slate-800 focus:outline-none focus:ring-1 focus:ring-amber-400"
-                >
-                  <option value="">Pick a strike…</option>
-                  {sortedStrikes.map(k => <option key={k} value={k}>{k}</option>)}
-                </select>
-                {focusStrike != null && (
-                  <button onClick={() => setFocusStrike(null)} className="text-[11px] font-mono text-slate-800 hover:text-slate-800 px-2 py-1.5">clear</button>
-                )}
-              </div>
-            </div>
-            <div className="px-5 py-4">
-              {!focusStrike && (
-                <p className="text-xs text-slate-800 font-mono">Select a strike above, or click any bar in the chart below, to see its target, stop-loss and trade math (in the verdict's {dirType || 'CE/PE'} direction).</p>
-              )}
-              {focusStrike != null && !fo && (
-                <p className="text-xs text-red-500 font-mono">Strike {focusStrike} not found in the current chain. Pick another.</p>
-              )}
-              {fo && (
-                <div>
-                  <div className="flex items-baseline gap-3 flex-wrap mb-3">
-                    <span className="text-lg font-bold text-slate-800 font-mono">{fo.strike} {dirType}</span>
-                    <span className="text-[10px] font-mono text-slate-800 uppercase">{fo.depthLabel}</span>
-                    <span className="text-sm text-slate-800 font-mono">entry ₹{fo.entryPremium.toFixed(2)}</span>
-                  </div>
-                  <div className="grid grid-cols-2 sm:grid-cols-4 gap-3 text-xs font-mono">
-                    <div><div className="text-slate-800 mb-0.5">Target</div><div className="text-emerald-700 font-bold">₹{fo.targetPremiumPerShare.toFixed(2)}</div></div>
-                    <div><div className="text-slate-800 mb-0.5">Stop-loss</div><div className="text-red-600 font-bold">₹{fo.slPremiumPerShare.toFixed(2)}</div></div>
-                    <div><div className="text-slate-800 mb-0.5">Profit/lot</div><div className={fo.profitPerLot >= 0 ? 'text-emerald-700' : 'text-red-600'}>{fo.profitPerLot >= 0 ? '+' : '−'}₹{Math.abs(fo.profitPerLot).toFixed(0)}</div></div>
-                    <div><div className="text-slate-800 mb-0.5">Loss/lot</div><div className="text-red-600">−₹{Math.abs(fo.lossPerLot).toFixed(0)}</div></div>
-                    <div><div className="text-slate-800 mb-0.5">Delta</div><div className="text-slate-800">{(dirType === 'PE' ? '−' : '')}{fo.entryDelta.toFixed(3)}</div></div>
-                    <div><div className="text-slate-800 mb-0.5">Theta/day</div><div className="text-red-600">−₹{fo.entryTheta.toFixed(2)}</div></div>
-                    <div><div className="text-slate-800 mb-0.5">Capital</div><div className="text-slate-800">₹{fo.capitalRequiredPerLot.toFixed(0)}</div></div>
-                    <div><div className="text-slate-800 mb-0.5">ROI</div><div className={fo.returnOnCapitalPct >= 0 ? 'text-emerald-700' : 'text-red-600'}>{fo.returnOnCapitalPct.toFixed(0)}%</div></div>
-                  </div>
-                  {fo.decayChallenged && (
-                    <div className="mt-3 text-[11px] font-mono text-amber-600 border-t border-amber-100 pt-2">
-                      ⚠ Decay-challenged: the projected move is too small to clear theta + IV-crush at this strike by 3:05 PM. Target is a minimal floor above entry — weak setup.
-                    </div>
-                  )}
-                </div>
-              )}
-            </div>
-          </div>
-        );
-      })()}
 
       {/* COMBINED FOOTPRINT — the single consolidated OI chart; bars are clickable to focus a strike */}
       <div className="bg-white border border-slate-200 rounded-xl card-shadow overflow-hidden">
@@ -3199,6 +3235,7 @@ function FootprintChart({ rows, spot, atmStrike, onSelectStrike }) {
   const [minStrike, setMinStrike] = useState(minAvail);
   const [maxStrike, setMaxStrike] = useState(maxAvail);
   const [showTotalOI, setShowTotalOI] = useState(true);
+  const [hover, setHover] = useState(null); // index of hovered strike group
 
   // Determine the visible window
   let windowRows;
@@ -3214,22 +3251,6 @@ function FootprintChart({ rows, spot, atmStrike, onSelectStrike }) {
     windowRows = rows.filter(r => r.strike >= minStrike && r.strike <= maxStrike);
   }
 
-  // Build chart data. Solid = |ΔOI| (today's change); cap = total OI minus |ΔOI| (the rest).
-  // Decrease (unwinding) is rendered with a hollow look (light fill + colored outline).
-  const data = windowRows.map(r => {
-    const callChg = r.ce.chngOi;
-    const putChg = r.pe.chngOi;
-    return {
-      strike: r.strike,
-      callSolid: Math.abs(callChg),
-      callCap: showTotalOI ? Math.max(r.ce.oi - Math.abs(callChg), 0) : 0,
-      callIncrease: callChg >= 0,
-      putSolid: Math.abs(putChg),
-      putCap: showTotalOI ? Math.max(r.pe.oi - Math.abs(putChg), 0) : 0,
-      putIncrease: putChg >= 0,
-    };
-  });
-
   const fmtOI = (v) => {
     if (v >= 10000000) return (v / 10000000).toFixed(2) + 'Cr';
     if (v >= 100000) return (v / 100000).toFixed(1) + 'L';
@@ -3242,23 +3263,60 @@ function FootprintChart({ rows, spot, atmStrike, onSelectStrike }) {
   const totPutChg = windowRows.reduce((s, r) => s + r.pe.chngOi, 0);
   const deltaPcr = totCallChg !== 0 ? (totPutChg / totCallChg) : 0;
 
-  // Custom bar shapes: solid fill for increase, hollow (light fill + dashed stroke) for decrease.
-  // Leg ('call'|'put') is bound explicitly since Recharts 2.x doesn't reliably pass dataKey to shape.
-  const makeSolidBar = (leg, fillIncrease, fillDecrease, strokeColor) => (props) => {
-    const { x, y, width, height, payload } = props;
-    if (!height || height <= 0 || !width || width <= 0) return null;
-    const increase = leg === 'call' ? payload.callIncrease : payload.putIncrease;
-    if (increase) {
-      return <rect x={x} y={y} width={width} height={height} fill={fillIncrease} />;
-    }
-    return <rect x={x} y={y} width={width} height={height} fill={fillDecrease} stroke={strokeColor} strokeWidth={1.5} strokeDasharray="3 2" />;
-  };
-
   // Spot reference: find nearest strike index for the dashed line
   const nearestSpotStrike = windowRows.reduce((best, r) =>
     Math.abs(r.strike - spot) < Math.abs(best - spot) ? r.strike : best, windowRows[0]?.strike);
 
   const nAtmOptions = [5, 10, 15, 20, 'all'];
+
+  // --- Sensibull-style SVG geometry ---
+  const groups = windowRows.length;
+  const groupPx = 46;
+  const chartW = Math.max(680, groups * groupPx);
+  const chartH = 340;
+  const mL = 50, mR = 14, mT = 16, mB = 46;
+  const plotW = chartW - mL - mR;
+  const plotH = chartH - mT - mB;
+  const baseY = mT + plotH;
+  const gw = groups > 0 ? plotW / groups : plotW;
+  const barW = Math.max(6, Math.min(18, gw * 0.32));
+  const barGap = Math.max(2, gw * 0.06);
+  let maxV = 1;
+  windowRows.forEach(r => {
+    const cands = showTotalOI
+      ? [r.pe.oi, r.pe.oi - r.pe.chngOi, r.ce.oi, r.ce.oi - r.ce.chngOi]
+      : [Math.abs(r.pe.chngOi), Math.abs(r.ce.chngOi)];
+    cands.forEach(v => { if (v > maxV) maxV = v; });
+  });
+  maxV *= 1.08;
+  const yOf = v => mT + (1 - Math.max(v, 0) / maxV) * plotH;
+  const yTicks = [0, 0.25, 0.5, 0.75, 1].map(f => f * maxV);
+  const spotIdx = windowRows.findIndex(r => r.strike === nearestSpotStrike);
+  // One side's bars (solid base = OI held from before, striped cap = added today,
+  // hollow dashed cap = removed today). When "show total OI" is off, only today's change shows.
+  const sideBars = (r, x, side) => {
+    const oi = side === 'put' ? r.pe.oi : r.ce.oi;
+    const chg = side === 'put' ? r.pe.chngOi : r.ce.chngOi;
+    const solid = side === 'put' ? '#10b981' : '#ef4444';
+    const stripe = side === 'put' ? 'url(#pStripe)' : 'url(#cStripe)';
+    const els = [];
+    if (!showTotalOI) {
+      const mag = Math.abs(chg);
+      if (chg >= 0) els.push(<rect key="c" x={x} y={yOf(mag)} width={barW} height={baseY - yOf(mag)} fill={solid} />);
+      else els.push(<rect key="c" x={x} y={yOf(mag)} width={barW} height={baseY - yOf(mag)} fill="none" stroke={solid} strokeWidth="1.2" strokeDasharray="3 2" />);
+      return els;
+    }
+    if (chg >= 0) {
+      const prior = Math.max(oi - chg, 0);
+      els.push(<rect key="s" x={x} y={yOf(prior)} width={barW} height={baseY - yOf(prior)} fill={solid} />);
+      if (chg > 0) els.push(<rect key="i" x={x} y={yOf(oi)} width={barW} height={yOf(prior) - yOf(oi)} fill={stripe} stroke={solid} strokeWidth="0.5" />);
+    } else {
+      const prior = oi - chg; // oi + |chg|
+      els.push(<rect key="s" x={x} y={yOf(oi)} width={barW} height={baseY - yOf(oi)} fill={solid} />);
+      els.push(<rect key="d" x={x} y={yOf(prior)} width={barW} height={yOf(oi) - yOf(prior)} fill="none" stroke={solid} strokeWidth="1.2" strokeDasharray="3 2" />);
+    }
+    return els;
+  };
 
   return (
     <div className="space-y-3">
@@ -3317,36 +3375,78 @@ function FootprintChart({ rows, spot, atmStrike, onSelectStrike }) {
       </div>
 
       {/* Legend */}
-      <div className="flex flex-wrap gap-3 text-[10px] font-mono text-slate-800">
-        <span className="flex items-center gap-1.5"><span className="w-3 h-3 rounded-sm" style={{ background: '#10b981' }}></span>Put ΔOI (writing)</span>
-        <span className="flex items-center gap-1.5"><span className="w-3 h-3 rounded-sm" style={{ background: '#a7f3d0' }}></span>Put total OI</span>
-        <span className="flex items-center gap-1.5"><span className="w-3 h-3 rounded-sm" style={{ background: '#ef4444' }}></span>Call ΔOI (writing)</span>
-        <span className="flex items-center gap-1.5"><span className="w-3 h-3 rounded-sm" style={{ background: '#fecaca' }}></span>Call total OI</span>
-        <span className="flex items-center gap-1.5"><span className="w-3 h-3 rounded-sm border border-dashed border-slate-400" style={{ background: 'transparent' }}></span>dashed = unwinding</span>
+      <div className="flex flex-wrap gap-x-3 gap-y-1.5 text-[10px] font-mono text-slate-800">
+        <span className="flex items-center gap-1.5"><span className="w-3 h-3 rounded-sm" style={{ background: '#10b981' }}></span>Put OI held</span>
+        <span className="flex items-center gap-1.5"><span className="w-3 h-3 rounded-sm" style={{ background: 'repeating-linear-gradient(45deg,#10b981,#10b981 2px,transparent 2px,transparent 4px)', border: '0.5px solid #10b981' }}></span>Put added today</span>
+        <span className="flex items-center gap-1.5"><span className="w-3.5 h-3 rounded-sm border border-dashed" style={{ borderColor: '#10b981', background: 'transparent' }}></span>Put removed</span>
+        <span className="flex items-center gap-1.5"><span className="w-3 h-3 rounded-sm" style={{ background: '#ef4444' }}></span>Call OI held</span>
+        <span className="flex items-center gap-1.5"><span className="w-3 h-3 rounded-sm" style={{ background: 'repeating-linear-gradient(45deg,#ef4444,#ef4444 2px,transparent 2px,transparent 4px)', border: '0.5px solid #ef4444' }}></span>Call added today</span>
+        <span className="flex items-center gap-1.5"><span className="w-3.5 h-3 rounded-sm border border-dashed" style={{ borderColor: '#ef4444', background: 'transparent' }}></span>Call removed</span>
       </div>
 
-      <ResponsiveContainer width="100%" height={340}>
-        <BarChart data={data} margin={{ top: 10, right: 10, left: 0, bottom: 30 }} barGap={2} barCategoryGap="20%"
-          onClick={(st) => { if (onSelectStrike && st && st.activeLabel != null) onSelectStrike(Number(st.activeLabel)); }}
-          style={onSelectStrike ? { cursor: 'pointer' } : undefined}>
-          <XAxis dataKey="strike" stroke="#94a3b8" tick={{ fontSize: 10, fontFamily: 'JetBrains Mono' }} angle={-45} textAnchor="end" height={50} interval={0} />
-          <YAxis stroke="#94a3b8" tick={{ fontSize: 10, fontFamily: 'JetBrains Mono' }} tickFormatter={fmtOI} />
-          <Tooltip
-            contentStyle={{ background: '#ffffff', border: '1px solid #e2e8f0', borderRadius: '6px', fontSize: '12px', fontFamily: 'JetBrains Mono' }}
-            labelStyle={{ color: '#0f172a', fontWeight: 600 }}
-            formatter={(v, name) => [fmtOI(v), name]}
-          />
-          {nearestSpotStrike != null && (
-            <ReferenceLine x={nearestSpotStrike} stroke="#475569" strokeDasharray="5 4" label={{ value: 'spot', position: 'top', fontSize: 10, fill: '#475569', fontFamily: 'JetBrains Mono' }} />
+      {/* Sensibull-style OI chart (custom SVG) */}
+      <div className="relative overflow-x-auto">
+        <svg width={chartW} height={chartH} viewBox={`0 0 ${chartW} ${chartH}`} style={{ display: 'block', fontFamily: 'JetBrains Mono, monospace' }}>
+          <defs>
+            <pattern id="pStripe" patternUnits="userSpaceOnUse" width="5" height="5" patternTransform="rotate(45)">
+              <line x1="0" y1="0" x2="0" y2="5" stroke="#10b981" strokeWidth="2.5" />
+            </pattern>
+            <pattern id="cStripe" patternUnits="userSpaceOnUse" width="5" height="5" patternTransform="rotate(45)">
+              <line x1="0" y1="0" x2="0" y2="5" stroke="#ef4444" strokeWidth="2.5" />
+            </pattern>
+          </defs>
+          {/* gridlines + y labels */}
+          {yTicks.map((v, i) => (
+            <g key={`g${i}`}>
+              <line x1={mL} y1={yOf(v)} x2={chartW - mR} y2={yOf(v)} stroke="#e2e8f0" strokeWidth="1" />
+              <text x={mL - 6} y={yOf(v) + 3} textAnchor="end" fontSize="10" fill="#94a3b8">{fmtOI(v)}</text>
+            </g>
+          ))}
+          {/* spot line */}
+          {spotIdx >= 0 && (
+            <g>
+              <line x1={mL + spotIdx * gw + gw / 2} y1={mT} x2={mL + spotIdx * gw + gw / 2} y2={baseY} stroke="#475569" strokeWidth="1" strokeDasharray="4 3" />
+              <text x={mL + spotIdx * gw + gw / 2} y={mT - 5} textAnchor="middle" fontSize="10" fill="#475569">spot</text>
+            </g>
           )}
-          {/* Put stack: solid ΔOI (bottom) + light total cap (top) */}
-          <Bar dataKey="putSolid" stackId="put" name="Put ΔOI" shape={makeSolidBar('put', '#10b981', '#ecfdf5', '#10b981')} />
-          <Bar dataKey="putCap" stackId="put" name="Put total OI" fill="#a7f3d0" opacity={0.7} />
-          {/* Call stack */}
-          <Bar dataKey="callSolid" stackId="call" name="Call ΔOI" shape={makeSolidBar('call', '#ef4444', '#fef2f2', '#ef4444')} />
-          <Bar dataKey="callCap" stackId="call" name="Call total OI" fill="#fecaca" opacity={0.7} />
-        </BarChart>
-      </ResponsiveContainer>
+          {/* bars */}
+          {windowRows.map((r, i) => {
+            const cx = mL + i * gw + gw / 2;
+            const putX = cx - barGap / 2 - barW;
+            const callX = cx + barGap / 2;
+            return (
+              <g key={r.strike}>
+                {sideBars(r, putX, 'put')}
+                {sideBars(r, callX, 'call')}
+                <text x={cx} y={baseY + 14} textAnchor="middle" fontSize="9.5" fill={r.strike === nearestSpotStrike ? '#0f172a' : '#94a3b8'} fontWeight={r.strike === nearestSpotStrike ? 700 : 400}>{r.strike}</text>
+                {/* hover hit area */}
+                <rect x={mL + i * gw} y={mT} width={gw} height={plotH} fill="transparent"
+                  onMouseEnter={() => setHover(i)} onMouseLeave={() => setHover(h => h === i ? null : h)}
+                  style={onSelectStrike ? { cursor: 'pointer' } : undefined}
+                  onClick={() => onSelectStrike && onSelectStrike(r.strike)} />
+              </g>
+            );
+          })}
+          <line x1={mL} y1={baseY} x2={chartW - mR} y2={baseY} stroke="#cbd5e1" strokeWidth="1" />
+        </svg>
+        {/* tooltip */}
+        {hover != null && windowRows[hover] && (() => {
+          const r = windowRows[hover];
+          const cx = mL + hover * gw + gw / 2;
+          const left = Math.min(Math.max(cx - 80, 0), chartW - 168);
+          const sign = v => (v >= 0 ? '+' : '');
+          return (
+            <div className="absolute pointer-events-none bg-white border border-slate-200 rounded-md shadow-lg px-3 py-2 text-[11px] font-mono"
+              style={{ left, top: 4, width: 160 }}>
+              <div className="font-bold text-slate-800 mb-1">Strike {r.strike}</div>
+              <div className="flex justify-between text-emerald-700"><span>Put OI</span><span>{fmtOI(r.pe.oi)}</span></div>
+              <div className="flex justify-between text-emerald-600"><span>Put chg</span><span>{sign(r.pe.chngOi)}{fmtOI(r.pe.chngOi)}</span></div>
+              <div className="flex justify-between text-red-700 mt-1"><span>Call OI</span><span>{fmtOI(r.ce.oi)}</span></div>
+              <div className="flex justify-between text-red-600"><span>Call chg</span><span>{sign(r.ce.chngOi)}{fmtOI(r.ce.chngOi)}</span></div>
+            </div>
+          );
+        })()}
+      </div>
 
       {/* Summary footer */}
       <div className="flex flex-wrap gap-x-6 gap-y-1 pt-3 border-t border-slate-200 text-[11px] font-mono">
@@ -3362,16 +3462,16 @@ function FootprintChart({ rows, spot, atmStrike, onSelectStrike }) {
         <div className="text-[11px] font-semibold text-slate-800 mb-2">How to read this chart</div>
         <ul className="space-y-1.5 text-[11px] text-slate-800 leading-relaxed">
           <li><span className="inline-block w-2.5 h-2.5 rounded-sm align-middle mr-1.5" style={{ background: '#10b981' }}></span>
-            <span className="font-semibold text-emerald-700">Green = puts.</span> The solid dark base is today's put OI added (writers selling puts = building a floor / support). Tall green = strong support at that strike.</li>
+            <span className="font-semibold text-emerald-700">Green = puts.</span> The bar's coloured height is the put OI standing now at that strike. Tall green near/below spot = put writers building a floor (support).</li>
           <li><span className="inline-block w-2.5 h-2.5 rounded-sm align-middle mr-1.5" style={{ background: '#ef4444' }}></span>
-            <span className="font-semibold text-red-700">Red = calls.</span> The solid dark base is today's call OI added (writers selling calls = building a ceiling / resistance). Tall red = strong resistance at that strike.</li>
-          <li><span className="inline-block w-2.5 h-2.5 rounded-sm align-middle mr-1.5" style={{ background: '#a7f3d0' }}></span>
-            <span className="font-semibold text-slate-800">Light cap on top = total standing OI</span> (yesterday's + today's). The solid part vs the light cap shows how much of the wall was built <span className="italic">today</span> vs already there.</li>
+            <span className="font-semibold text-red-700">Red = calls.</span> Coloured height = call OI standing now. Tall red above spot = call writers building a ceiling (resistance).</li>
+          <li><span className="inline-block w-2.5 h-2.5 rounded-sm align-middle mr-1.5" style={{ background: 'repeating-linear-gradient(45deg,#64748b,#64748b 2px,transparent 2px,transparent 4px)', border: '0.5px solid #64748b' }}></span>
+            <span className="font-semibold text-slate-800">Striped cap = added today.</span> The hatched portion on top is OI written today — fresh conviction. The solid base was already there.</li>
           <li><span className="inline-block w-3 h-2.5 align-middle mr-1.5 border border-dashed border-slate-400" style={{ background: 'transparent' }}></span>
-            <span className="font-semibold text-slate-800">Dashed/hollow bar = unwinding</span> (OI fell today). Writers covering — the wall is weakening, not building.</li>
+            <span className="font-semibold text-slate-800">Hollow cap = removed today.</span> A dashed "ghost" above the bar means OI was unwound — the wall is weakening, not building.</li>
           <li><span className="text-slate-800 mr-1.5">┊</span>
-            <span className="font-semibold text-slate-800">Dashed vertical line = spot.</span> Big green walls below spot = support; big red walls above = resistance.</li>
-          <li className="pt-1 text-slate-800"><span className="font-semibold">Quick read:</span> heavier green below spot + heavier red above = range-bound. Green stacking up near spot = support rising (bullish). Red stacking down near spot = resistance capping (bearish).</li>
+            <span className="font-semibold text-slate-800">Dashed vertical line = spot.</span> Hover any strike for exact OI and today's change.</li>
+          <li className="pt-1 text-slate-800"><span className="font-semibold">Quick read:</span> heavier green below spot + heavier red above = range-bound. Green striping up near spot = support rising (bullish); red striping down near spot = resistance capping (bearish). Toggle "Show total OI" off to see only today's change.</li>
         </ul>
       </div>
     </div>
@@ -4007,6 +4107,14 @@ function SettingsModal({
     setProvider(localProvider);
     setDhanClientId(localId.trim());
     setDhanAccessToken(localToken.trim());
+    // Persist creds server-side so the background OI recorder can fetch without the browser open.
+    if (localProvider === 'dhan' && localId.trim() && localToken.trim()) {
+      fetch('/api/oi?op=token', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ clientId: localId.trim(), accessToken: localToken.trim(), symbols: ['NIFTY'] }),
+      }).catch(() => {});
+    }
     onClose();
   };
 
