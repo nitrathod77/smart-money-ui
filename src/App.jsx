@@ -6,6 +6,7 @@ import {
 } from 'lucide-react';
 import Login from './Login.jsx';
 import { Logo } from './Logo.jsx';
+import DecisionGate from './DecisionGate.jsx';
 
 // ============================================================================
 // DEMO DATA (NSE NIFTY option chain 27-May-2026 close, from your screenshot)
@@ -414,8 +415,10 @@ function detectFVGs(candles) {
 
 // Lookback scoping — ICT bias/zone should reflect recent sessions, not months of history.
 // Cap candles per timeframe so detection runs on a sensible window (≈ a handful of sessions).
+// 1M is the intraday ENTRY timeframe, so it needs a full session (~375 min) of history: the 1M
+// break that times the entry can fire hours after the 15M bias sweep.
 function scopeCandles(candles, interval) {
-  const lookback = { '1': 120, '5': 96, '15': 64, '25': 56, '60': 42 };
+  const lookback = { '1': 375, '5': 96, '15': 64, '25': 56, '60': 42 };
   const n = lookback[String(interval)] || 80;
   return candles.length > n ? candles.slice(-n) : candles;
 }
@@ -481,8 +484,101 @@ function qualifyMSS(sweeps, mss, withinBars = 6) {
 }
 
 // Top-down assembly — chains the layers into one checklist-style read. sets = {h1,m15,m5,m1} arrays.
-// 1H gives bias; 15M gives premium/discount + an OB zone; 5M gives the qualified sweep+MSS trigger;
-// 1M/5M last close is the working price. status: 'ready' (all align), 'forming' (partial), 'none'.
+// INTRADAY MODEL: 15M is the reference timeframe — it sets the BIAS, the premium/discount dealing
+// range, and the order-block entry zone, and it's where the primary liquidity sweep is detected.
+// 1M is the entry timeframe — it times the trigger (qualified sweep + MSS) within the 15M bias.
+// 1H is optional higher-timeframe context only (agreement flag), it does not set the bias.
+// status: 'ready' (1M trigger fired), 'armed' (15M swept, awaiting 1M), 'watching' (awaiting sweep).
+function ictTopDown(sets) {
+  const tf = (candles) => {
+    const sw = detectSwings(candles, 2);
+    return { candles, sw, sweeps: detectSweeps(candles, sw), mss: detectMSS(candles, sw), bias: structureBias(sw), obs: freshZones(markMitigated(detectOrderBlocks(candles), candles)) };
+  };
+  const m15 = sets.m15?.length ? tf(scopeCandles(sets.m15, '15')) : null;
+  const m1 = sets.m1?.length ? tf(scopeCandles(sets.m1, '1')) : null;
+  const h1 = sets.h1?.length ? tf(scopeCandles(sets.h1, '60')) : null; // optional context only
+  const price = sets.m1?.[sets.m1.length - 1]?.c ?? sets.m5?.[sets.m5.length - 1]?.c ?? sets.m15?.[sets.m15.length - 1]?.c ?? null;
+
+  // 15M = directional bias (the intraday reference). Prefer swing-structure; if that's inconclusive
+  // (no pivots on a trend leg, or mixed swings on chop), fall back to 15M momentum so strong moves
+  // still register.
+  let bias = m15?.bias || 'neutral';
+  let biasSource = 'structure';
+  if (bias === 'neutral') {
+    const tb = trendBias(m15?.candles);
+    if (tb !== 'neutral') { bias = tb; biasSource = 'momentum'; }
+  }
+  // Optional 1H agreement — context only, never overrides the 15M bias.
+  const htfBias = h1 ? (h1.bias !== 'neutral' ? h1.bias : trendBias(h1.candles)) : null;
+  const htfAgrees = (htfBias && htfBias !== 'neutral' && bias !== 'neutral') ? htfBias === bias : null;
+
+  const pd = m15 ? premiumDiscount(m15.sw, price) : null;
+  const zoneOk = !!(pd && ((bias === 'bullish' && pd.zone !== 'premium') || (bias === 'bearish' && pd.zone !== 'discount')));
+  const obDir = bias === 'bullish' ? 'bullish' : 'bearish';
+  const ob = m15?.obs.filter(o => o.type === obDir).slice(-1)[0] || null; // 15M order block = entry zone
+
+  // Key intraday liquidity (from raw multi-day candles): PDH/PDL + opening-range high/low. Prefer 5M
+  // for finer session mapping if present; otherwise use 15M.
+  const lv = sessionLevels(sets.m5 && sets.m5.length ? sets.m5 : (sets.m15 || []));
+  const buySide = lv ? [{ name: 'PDH', price: lv.pdh }, { name: 'opening-range high', price: lv.orh }].filter(x => x.price != null).map(x => ({ ...x, side: 'high' })) : [];
+  const sellSide = lv ? [{ name: 'PDL', price: lv.pdl }, { name: 'opening-range low', price: lv.orl }].filter(x => x.price != null).map(x => ({ ...x, side: 'low' })) : [];
+  const relevant = bias === 'bearish' ? buySide : bias === 'bullish' ? sellSide : [];
+
+  // PRIMARY sweep on 15M (today only) — a real liquidity grab of PDH/PDL/opening-range.
+  const today15 = lv ? (sets.m15 || []).filter(c => c.t >= lv.todayStart) : [];
+  const keySweeps = relevant.length ? detectKeyLevelSweeps(today15, relevant).filter(s => s.dir === bias) : [];
+  const keySweep = keySweeps[keySweeps.length - 1] || null;
+
+  // ENTRY trigger on 1M — qualified 1M sweep+MSS (inducement + break) aligned with bias, AFTER the
+  // 15M key sweep. This is the inducement-grab-then-shift on the entry timeframe.
+  let triggerFired = false;
+  if (keySweep && m1) {
+    const qmss = qualifyMSS(m1.sweeps, m1.mss).filter(m => m.dir === bias && m.t >= keySweep.t);
+    triggerFired = qmss.length > 0;
+  }
+
+  // Plan levels: the key level to be swept (sweepLevel) + the 1M level whose break confirms entry.
+  // Falls back to 15M swings for the break level if 1M has no qualifying swing yet.
+  let triggerPlan = null;
+  if ((m1 || m15) && bias !== 'neutral' && price != null) {
+    const src = (m1 && m1.sw.length >= 2) ? m1 : m15;
+    const lows = src.sw.filter(s => s.type === 'low').map(s => s.price);
+    const highs = src.sw.filter(s => s.type === 'high').map(s => s.price);
+    if (bias === 'bearish' && lows.length) {
+      const below = lows.filter(l => l < price).sort((a, b) => b - a);
+      triggerPlan = { dir: 'down', side: 'sell', sweepLevel: keySweep ? keySweep.price : (relevant[0]?.price ?? null), sweepName: keySweep ? keySweep.name : (relevant[0]?.name ?? 'a 15M swing high'), breakLevel: below[0] ?? Math.min(...lows) };
+    } else if (bias === 'bullish' && highs.length) {
+      const above = highs.filter(h => h > price).sort((a, b) => a - b);
+      triggerPlan = { dir: 'up', side: 'buy', sweepLevel: keySweep ? keySweep.price : (relevant[0]?.price ?? null), sweepName: keySweep ? keySweep.name : (relevant[0]?.name ?? 'a 15M swing low'), breakLevel: above[0] ?? Math.max(...highs) };
+    }
+  }
+
+  const notes = [];
+  let status = 'none';
+  if (bias === 'neutral') {
+    notes.push('Bias (15M): no clear trend (structure mixed and momentum flat) — best to stand aside');
+  } else {
+    const dirWord = bias === 'bullish' ? 'up' : 'down';
+    const side = bias === 'bullish' ? 'buy' : 'sell';
+    notes.push(`Bias (15M): trending ${dirWord}${biasSource === 'momentum' ? ' (by momentum)' : ''}`);
+    if (htfAgrees === false) notes.push('1H context disagrees — lower conviction, demand a clean 1M trigger');
+    if (pd) {
+      const half = pd.zone === 'premium' ? 'upper half' : pd.zone === 'discount' ? 'lower half' : 'middle';
+      notes.push(`Price is in the ${half} of its recent range`);
+    }
+    if (keySweep) notes.push(`15M sweep of ${keySweep.name} (${Math.round(keySweep.price)}) — liquidity grabbed`);
+    else if (relevant.length) notes.push(`Watching for a 15M sweep of ${relevant.map(r => r.name).join(' / ')}`);
+    else notes.push('No prior-day / opening-range level mapped yet');
+    notes.push(triggerFired ? `1M entry trigger FIRED (inducement grabbed + ${dirWord}-break)` : (keySweep ? '1M entry not fired yet' : 'no 15M sweep yet'));
+    if (ob) notes.push(`${side === 'buy' ? 'Buy' : 'Sell'} zone (15M OB): ${Math.round(ob.low)}–${Math.round(ob.high)}`);
+
+    if (keySweep && triggerFired) status = 'ready';
+    else if (keySweep) status = 'armed';
+    else status = 'watching';
+  }
+  return { bias, biasSource, htfAgrees, zone: pd?.zone || null, dealingRange: pd, zoneOk, ob, keyLevels: lv, keySweep, triggerFired, triggerPlan, status, notes, price };
+}
+
 // Session liquidity — the levels NIFTY actually hunts intraday: prior-day high/low (PDH/PDL)
 // and the opening-range (first hour) high/low. Computed from raw multi-day candles (timestamps
 // in epoch seconds; IST = UTC+5:30). Returns the latest session's reference levels.
@@ -530,87 +626,6 @@ function detectKeyLevelSweeps(candles, levels) {
   return out.sort((a, b) => a.t - b.t);
 }
 
-function ictTopDown(sets) {
-  const tf = (candles) => {
-    const sw = detectSwings(candles, 2);
-    return { candles, sw, sweeps: detectSweeps(candles, sw), mss: detectMSS(candles, sw), bias: structureBias(sw), obs: freshZones(markMitigated(detectOrderBlocks(candles), candles)) };
-  };
-  const h1 = sets.h1?.length ? tf(scopeCandles(sets.h1, '60')) : null;
-  const m15 = sets.m15?.length ? tf(scopeCandles(sets.m15, '15')) : null;
-  const m5 = sets.m5?.length ? tf(scopeCandles(sets.m5, '5')) : null;
-  const price = sets.m1?.[sets.m1.length - 1]?.c ?? sets.m5?.[sets.m5.length - 1]?.c ?? null;
-
-  // 1H = directional bias. Prefer swing-structure; if that's inconclusive (no pivots on a trend
-  // day, or mixed swings on a chop day), fall back to 1H momentum so strong moves still register.
-  let bias = h1?.bias || 'neutral';
-  let biasSource = 'structure';
-  if (bias === 'neutral') {
-    const tb = trendBias(h1?.candles) !== 'neutral' ? trendBias(h1?.candles) : trendBias(m15?.candles);
-    if (tb !== 'neutral') { bias = tb; biasSource = 'momentum'; }
-  }
-  const pd = m15 ? premiumDiscount(m15.sw, price) : null;
-  const zoneOk = !!(pd && ((bias === 'bullish' && pd.zone !== 'premium') || (bias === 'bearish' && pd.zone !== 'discount')));
-  const obDir = bias === 'bullish' ? 'bullish' : 'bearish';
-  const ob = m15?.obs.filter(o => o.type === obDir).slice(-1)[0] || null; // 15M order block = entry zone
-
-  // Key intraday liquidity (from raw multi-day 5M candles): PDH/PDL + opening-range high/low.
-  const lv = sessionLevels(sets.m5 && sets.m5.length ? sets.m5 : (sets.m15 || []));
-  const buySide = lv ? [{ name: 'PDH', price: lv.pdh }, { name: 'opening-range high', price: lv.orh }].filter(x => x.price != null).map(x => ({ ...x, side: 'high' })) : [];
-  const sellSide = lv ? [{ name: 'PDL', price: lv.pdl }, { name: 'opening-range low', price: lv.orl }].filter(x => x.price != null).map(x => ({ ...x, side: 'low' })) : [];
-  const relevant = bias === 'bearish' ? buySide : bias === 'bullish' ? sellSide : [];
-
-  // PRIMARY sweep on 15M (today only) — a real liquidity grab of PDH/PDL/opening-range.
-  const today15 = lv ? (sets.m15 || []).filter(c => c.t >= lv.todayStart) : [];
-  const keySweeps = relevant.length ? detectKeyLevelSweeps(today15, relevant).filter(s => s.dir === bias) : [];
-  const keySweep = keySweeps[keySweeps.length - 1] || null;
-
-  // ENTRY trigger on 5M — qualified 5M sweep+MSS (inducement + break) aligned with bias, AFTER
-  // the 15M key sweep. This is the inducement-grab-then-shift that confirms the entry.
-  let triggerFired = false;
-  if (keySweep && m5) {
-    const qmss = qualifyMSS(m5.sweeps, m5.mss).filter(m => m.dir === bias && m.t >= keySweep.t);
-    triggerFired = qmss.length > 0;
-  }
-
-  // Plan levels: the key level to be swept (sweepLevel) + the 5M level whose break confirms entry.
-  let triggerPlan = null;
-  if (m5 && bias !== 'neutral' && price != null) {
-    const lows = m5.sw.filter(s => s.type === 'low').map(s => s.price);
-    const highs = m5.sw.filter(s => s.type === 'high').map(s => s.price);
-    if (bias === 'bearish' && lows.length) {
-      const below = lows.filter(l => l < price).sort((a, b) => b - a);
-      triggerPlan = { dir: 'down', side: 'sell', sweepLevel: keySweep ? keySweep.price : (relevant[0]?.price ?? null), sweepName: keySweep ? keySweep.name : (relevant[0]?.name ?? 'a 15M swing high'), breakLevel: below[0] ?? Math.min(...lows) };
-    } else if (bias === 'bullish' && highs.length) {
-      const above = highs.filter(h => h > price).sort((a, b) => a - b);
-      triggerPlan = { dir: 'up', side: 'buy', sweepLevel: keySweep ? keySweep.price : (relevant[0]?.price ?? null), sweepName: keySweep ? keySweep.name : (relevant[0]?.name ?? 'a 15M swing low'), breakLevel: above[0] ?? Math.max(...highs) };
-    }
-  }
-
-  const notes = [];
-  let status = 'none';
-  if (bias === 'neutral') {
-    notes.push('Big picture (1H): no clear trend (structure mixed and momentum flat) — best to stand aside');
-  } else {
-    const dirWord = bias === 'bullish' ? 'up' : 'down';
-    const side = bias === 'bullish' ? 'buy' : 'sell';
-    notes.push(`Big picture (1H): trending ${dirWord}${biasSource === 'momentum' ? ' (by momentum)' : ''}`);
-    if (pd) {
-      const half = pd.zone === 'premium' ? 'upper half' : pd.zone === 'discount' ? 'lower half' : 'middle';
-      notes.push(`Price is in the ${half} of its recent range`);
-    }
-    if (keySweep) notes.push(`15M sweep of ${keySweep.name} (${Math.round(keySweep.price)}) — liquidity grabbed`);
-    else if (relevant.length) notes.push(`Watching for a 15M sweep of ${relevant.map(r => r.name).join(' / ')}`);
-    else notes.push('No prior-day / opening-range level mapped yet');
-    notes.push(triggerFired ? `5M entry trigger FIRED (inducement grabbed + ${dirWord}-break)` : (keySweep ? '5M entry not fired yet' : 'no 15M sweep yet'));
-    if (ob) notes.push(`${side === 'buy' ? 'Buy' : 'Sell'} zone (15M OB): ${Math.round(ob.low)}–${Math.round(ob.high)}`);
-
-    if (keySweep && triggerFired) status = 'ready';
-    else if (keySweep) status = 'armed';
-    else status = 'watching';
-  }
-  return { bias, zone: pd?.zone || null, dealingRange: pd, zoneOk, ob, keyLevels: lv, keySweep, triggerFired, triggerPlan, status, notes, price };
-}
-
 // Gamma confluence — overlays the ICT top-down setup with the options gamma read (pin/flip/regime).
 // ICT setups are sweep-and-reverse (mean-reversion-flavoured), so they align with a LONG-gamma
 // (vol-suppressing) regime and conflict with SHORT-gamma (trending). The pin is a magnet: bias is
@@ -637,7 +652,7 @@ function gammaConfluence(ict, gamma, spot) {
 }
 
 // Live setup decision. Turns the ICT top-down result + options confluence + mode into a single
-// fire/hold state. Balanced fires on the 3-gate structural core (bias + 15M sweep + 5M entry);
+// fire/hold state. Balanced fires on the 3-gate structural core (bias + 15M sweep + 1M entry);
 // Strict additionally requires the options read to agree. Pure — no side effects.
 function evalSignal(ict, mode = 'balanced') {
   if (!ict || ict.status === 'none' || !ict.bias || ict.bias === 'neutral') return { state: 'idle' };
@@ -645,7 +660,7 @@ function evalSignal(ict, mode = 'balanced') {
   const optionsAgree = conf === 'strong' || conf === 'supportive';
   const optionsFight = conf === 'conflicting';
   const base = { direction: ict.bias, side: ict.bias === 'bullish' ? 'BUY' : 'SELL', optionsAgree, optionsFight };
-  const core = ict.status === 'ready'; // bias + 15M key-level sweep + 5M entry break all true
+  const core = ict.status === 'ready'; // bias + 15M key-level sweep + 1M entry break all true
   if (!core) return { state: ict.status, ...base }; // 'armed' or 'watching'
   if (mode === 'strict' && !optionsAgree) return { state: 'armed_waiting_options', ...base };
   return {
@@ -2660,6 +2675,16 @@ function MainApp({ user, onLogout }) {
             </h1>
           </div>
           <div className="flex items-center gap-2 text-xs font-mono text-slate-400 flex-wrap">
+            <div className="flex items-center rounded-lg border border-slate-200 bg-slate-50 p-0.5 mr-1">
+              <button
+                onClick={() => setView('analyze')}
+                className={`px-3 py-1 rounded-md text-xs font-semibold transition ${view === 'analyze' ? 'bg-white text-slate-800 shadow-sm' : 'text-slate-500 hover:text-slate-700'}`}
+              >Analyze</button>
+              <button
+                onClick={() => setView('gate')}
+                className={`px-3 py-1 rounded-md text-xs font-semibold transition ${view === 'gate' ? 'bg-white text-amber-700 shadow-sm' : 'text-slate-500 hover:text-slate-700'}`}
+              >Decision Gate</button>
+            </div>
             <SymbolPicker value={symbol} onChange={setSymbol} symbols={symbolList} />
             <input
               type="date"
@@ -2798,7 +2823,7 @@ function MainApp({ user, onLogout }) {
             {/* ICT TOP-DOWN ASSEMBLY result */}
             {user?.isAdmin && provider === 'dhan' && ictResult && (
               <div className={`mb-4 border rounded-lg px-3 py-2 ${ictResult.status === 'ready' ? 'border-emerald-300 bg-emerald-50' : ictResult.status === 'forming' ? 'border-amber-300 bg-amber-50' : 'border-slate-200 bg-slate-50'}`}>
-                {ictResult.loading ? <span className="text-[11px] font-mono text-slate-500">running 1H/15M/5M/1M…</span>
+                {ictResult.loading ? <span className="text-[11px] font-mono text-slate-500">running 15M bias + 1M entry…</span>
                   : ictResult.error ? <span className="text-[11px] font-mono text-red-600">err: {ictResult.error}</span>
                   : (
                     <div className="text-[11px] font-mono text-slate-700">
@@ -2808,7 +2833,7 @@ function MainApp({ user, onLogout }) {
                         signal?.state === 'fired' ? `🔔 FIRED — ${signal.side}`
                           : signal?.state === 'armed_waiting_options' ? 'SETUP ARMED — waiting for options to agree (strict)'
                           : ictResult.status === 'ready' ? 'TRIGGER FIRED'
-                          : ictResult.status === 'armed' ? 'SETUP ARMED — awaiting 5M entry'
+                          : ictResult.status === 'armed' ? 'SETUP ARMED — awaiting 1M entry'
                           : ictResult.status === 'watching' ? 'WATCHING — awaiting 15M sweep'
                           : 'no clear setup yet'
                       }</span>
@@ -2817,13 +2842,13 @@ function MainApp({ user, onLogout }) {
                         <span className="block mt-1.5 font-sans text-slate-800 bg-slate-50 border border-slate-200 rounded px-2 py-1.5">
                           <span className="uppercase tracking-wider text-[10px] text-slate-500">Your plan: </span>
                           {ictResult.status === 'watching' && ictResult.triggerPlan.sweepLevel != null && (
-                            <>Wait for a 15M sweep of <span className="font-bold">{ictResult.triggerPlan.sweepName} ({Math.round(ictResult.triggerPlan.sweepLevel)})</span>. Then {ictResult.triggerPlan.side}{' '}{ictResult.ob ? <>into <span className="font-bold">{Math.round(ictResult.ob.low)}–{Math.round(ictResult.ob.high)}</span></> : 'into the 15M order block'} on a 5M close {ictResult.triggerPlan.dir === 'down' ? 'below' : 'above'} <span className="font-bold">{Math.round(ictResult.triggerPlan.breakLevel)}</span>.</>
+                            <>Wait for a 15M sweep of <span className="font-bold">{ictResult.triggerPlan.sweepName} ({Math.round(ictResult.triggerPlan.sweepLevel)})</span>. Then {ictResult.triggerPlan.side}{' '}{ictResult.ob ? <>into <span className="font-bold">{Math.round(ictResult.ob.low)}–{Math.round(ictResult.ob.high)}</span></> : 'into the 15M order block'} on a 1M close {ictResult.triggerPlan.dir === 'down' ? 'below' : 'above'} <span className="font-bold">{Math.round(ictResult.triggerPlan.breakLevel)}</span>.</>
                           )}
                           {ictResult.status === 'armed' && (
-                            <><span className="font-bold">{ictResult.triggerPlan.sweepName}</span> swept — setup armed. {ictResult.triggerPlan.side === 'sell' ? 'Sell' : 'Buy'} {ictResult.ob ? <>into <span className="font-bold">{Math.round(ictResult.ob.low)}–{Math.round(ictResult.ob.high)}</span></> : 'into the 15M order block'}; set an alert to enter on a 5M close {ictResult.triggerPlan.dir === 'down' ? 'below' : 'above'} <span className="font-bold">{Math.round(ictResult.triggerPlan.breakLevel)}</span>.</>
+                            <><span className="font-bold">{ictResult.triggerPlan.sweepName}</span> swept — setup armed. {ictResult.triggerPlan.side === 'sell' ? 'Sell' : 'Buy'} {ictResult.ob ? <>into <span className="font-bold">{Math.round(ictResult.ob.low)}–{Math.round(ictResult.ob.high)}</span></> : 'into the 15M order block'}; set an alert to enter on a 1M close {ictResult.triggerPlan.dir === 'down' ? 'below' : 'above'} <span className="font-bold">{Math.round(ictResult.triggerPlan.breakLevel)}</span>.</>
                           )}
                           {ictResult.status === 'ready' && (
-                            <>Triggered — <span className="font-bold">{ictResult.triggerPlan.sweepName}</span> swept and 5M broke {ictResult.triggerPlan.dir === 'down' ? 'below' : 'above'} <span className="font-bold">{Math.round(ictResult.triggerPlan.breakLevel)}</span>. Confirm on the chart before entering.</>
+                            <>Triggered — <span className="font-bold">{ictResult.triggerPlan.sweepName}</span> swept and 1M broke {ictResult.triggerPlan.dir === 'down' ? 'below' : 'above'} <span className="font-bold">{Math.round(ictResult.triggerPlan.breakLevel)}</span>. Confirm on the chart before entering.</>
                           )}
                         </span>
                       )}
@@ -2996,6 +3021,23 @@ function MainApp({ user, onLogout }) {
               )}
             </div>
 
+            {current && (() => {
+              const sc = current.analysis?.verdict?.score ?? 0;
+              const lean = sc >= 1 ? { t: 'leans long', c: 'text-emerald-700' } : sc <= -1 ? { t: 'leans short', c: 'text-red-700' } : { t: 'is range-bound', c: 'text-slate-600' };
+              return (
+                <button
+                  onClick={() => setView('gate')}
+                  className="w-full mb-4 flex items-center gap-3 rounded-xl border border-amber-200 bg-amber-50/60 hover:bg-amber-50 px-4 py-3 text-left transition"
+                >
+                  <ChevronRight className="w-4 h-4 text-amber-600 flex-shrink-0" />
+                  <span className="text-sm text-slate-700">
+                    Chain positioning <span className={`font-semibold ${lean.c}`}>{lean.t}</span>. Positioning isn't permission —
+                    <span className="font-semibold text-amber-700"> run it through the Decision Gate</span> before you click buy.
+                  </span>
+                  <span className="ml-auto text-[10px] font-mono uppercase tracking-widest text-amber-600 whitespace-nowrap">3-gate check →</span>
+                </button>
+              );
+            })()}
             {current ? (
               <AnalysisView snapshot={current} comparison={comparison} previousInterval={previousInterval} user={user} />
             ) : (
@@ -3032,6 +3074,27 @@ function MainApp({ user, onLogout }) {
             )}
           </>
         )}
+
+        {view === 'gate' && (() => {
+          const gateIdea = (current?.analysis && current?.rows && current?.spot)
+            ? generateTradeIdea(current.analysis, current.rows, current.spot, current.expiry, null, getLotSize(symbol), symbol)
+            : null;
+          return (
+          <DecisionGate
+            analysis={current?.analysis || null}
+            spot={current?.spot ?? null}
+            symbol={symbol}
+            vix={vixInput ? parseFloat(vixInput) : null}
+            vixPrev={vixPrevCloseInput ? parseFloat(vixPrevCloseInput) : null}
+            gift={giftNiftyInput ? parseFloat(giftNiftyInput) : null}
+            giftPrev={giftPrevCloseInput ? parseFloat(giftPrevCloseInput) : null}
+            isExpiryDay={current?.expiry ? daysToExpiryFromDate(current.expiry) <= 0 : false}
+            dateKey={dateKey}
+            storage={storage}
+            idea={gateIdea}
+          />
+          );
+        })()}
 
       </div>
 
@@ -3160,7 +3223,7 @@ function AnalysisView({ snapshot, comparison, previousInterval, user }) {
         </button>
         {footprintOpen && (
           <div className="px-5 pb-5 border-t border-slate-100 pt-4">
-            <FootprintChart rows={rows} spot={spot} atmStrike={atmStrike} onSelectStrike={setFocusStrike} />>
+            <FootprintChart rows={rows} spot={spot} atmStrike={atmStrike} onSelectStrike={setFocusStrike} />
           </div>
         )}
       </div>
